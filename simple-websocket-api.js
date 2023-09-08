@@ -61,7 +61,7 @@ export class SimpleWebSocketAPI extends EventEmitter {
     for (const [event, listener] of Object.entries(this.#wsListeners)) {
       this.#ws.addEventListener(event, listener, {once: event != 'message'})
     }
-    this.once('close', this.#removeWsListeners)
+    this.once('close', this.#removeWsListeners.bind(this))
     if (this.isOpen) this.emit('open')
   }
 
