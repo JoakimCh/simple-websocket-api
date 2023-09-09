@@ -4,7 +4,16 @@
 // const CONNECTING = 0
 const OPEN = 1
 // const CLOSING = 2
-// const CLOSED = 3
+const CLOSED = 3
+
+/** Can be identified using `error?.name == 'SimpleWebSocketAPI_Error'` */
+class SimpleWebSocketAPI_Error extends Error {
+  constructor(message, code = 'INVALID_PARAMETER') {
+    super(message)
+    this.name = this.constructor.name
+    this.code = code
+  }
+}
 
 export class SimpleWebSocketAPI extends EventEmitter {
   jsonReplacer; debug
@@ -13,22 +22,26 @@ export class SimpleWebSocketAPI extends EventEmitter {
   #msgId = 0
   #awaitingReply = new Map()
   #awaitingBinaryReply
+  #destroyOnClose
   #destroyed
 
   get ws() {return this.#ws}
   get isOpen() {return this.#ws?.readyState == OPEN}
+  get isClosed() {return this.#ws?.readyState == CLOSED}
 
   constructor({
     ws, // the WebSocket to use
-    debug = false, // whether to debug protocol IO
-    jsonReplacer = null, // optional JSON replacer
+    debug, // whether to debug protocol IO
+    jsonReplacer, // optional JSON replacer
     binaryType = globalThis.process?.versions?.node ? 'nodebuffer' : 'arraybuffer', // the binary format to use over the WebSocket (if sending binary data)
+    destroyOnClose
   } = {}) {
     super()
     Object.seal(this) // useful to prevent mistakes
     this.#binaryType = binaryType
+    this.#destroyOnClose = destroyOnClose
     this.jsonReplacer = jsonReplacer
-    this.debug = !debug ? false : (text, value) => {
+    this.debug = !debug ? null : (text, value) => {
       if (value != undefined) {
         console.log(text+': ')
         console.dir(value, {depth: null, colors: true})
@@ -56,33 +69,44 @@ export class SimpleWebSocketAPI extends EventEmitter {
   changeWebSocket(newWebSocket) {
     if (this.#destroyed) return
     this.#removeWsListeners()
+    this.once('close', () => {
+      this.#removeWsListeners()
+      if (this.#destroyOnClose) this.destroy()
+    })
     this.#ws = newWebSocket
+    if (this.isClosed) { // if newWebSocket is already closed
+      setTimeout(0, this.emit.bind(this), 'close', {code: 4001, reason: 'Socket already closed.'})
+      return
+    }
     this.#ws.binaryType = this.#binaryType
     for (const [event, listener] of Object.entries(this.#wsListeners)) {
       this.#ws.addEventListener(event, listener, {once: event != 'message'})
     }
-    this.once('close', this.#removeWsListeners.bind(this))
-    if (this.isOpen) this.emit('open')
+    if (this.isOpen) setTimeout(0, this.emit.bind(this), 'open')
   }
 
-  /** Tries to clean up everything so the garbage collector can collect it and its WebSocket. */
+  /** Closes the WebSocket and emits a close event with code 4000 (if not already closed) and then removes any event listeners (since no more events will be sent). Now this instance is ready to be garbage collected if there are no more references to it. */
   destroy() {
-    if (this.#ws) this.#ws.close()
+    if (this.#destroyed) return
     this.#destroyed = true
-    this.removeAllListeners() // remove own listeners
     this.#awaitingReply.clear()
+    if (this.#ws && this.#ws.readyState != CLOSED) {
+      this.#ws.close()
+      this.emit('close', {code: 4000, reason: 'SimpleWebSocketAPI destroy call', wasClean: true})
+    }
+    this.removeAllListeners() // remove own listeners
   }
 
   send(cmd, payload, replyTimeout = 2000) {
     if (this.#destroyed || this.#ws?.readyState != OPEN) return
-    if (typeof cmd != 'string') throw Error('cmd must be a string.')
-    if (cmd.startsWith('int:')) throw Error('Only internal commands can start with "int:".')
-    if (['open','close','error','newListener','removeListener'].includes(cmd)) throw Error(`A command can not be named ${cmd} because that's an event emitted by this class.`)
+    if (typeof cmd != 'string') throw new SimpleWebSocketAPI_Error(`cmd must be a string.`)
+    if (cmd.startsWith('int:')) throw new SimpleWebSocketAPI_Error(`Only internal commands can start with "int:".`)
+    if (['open','close','error','newListener','removeListener'].includes(cmd)) throw new SimpleWebSocketAPI_Error(`A command can not be named ${cmd} because that's an event emitted by this class.`)
     const id = this.#msgId ++
     this.debug?.('outgoing', {cmd, payload, id})
     this.#ws.send(JSON.stringify({cmd, payload, id}, this.jsonReplacer))
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(reject, replyTimeout)
+      const timeout = setTimeout(reject, replyTimeout, new SimpleWebSocketAPI_Error(`A reply for "${cmd}" was not received within the replyTimeout period of ${replyTimeout} ms.`, 'REPLY_TIMEOUT'))
       this.#awaitingReply.set(id, {
         resolve: result => {
           clearTimeout(timeout)
@@ -100,7 +124,7 @@ export class SimpleWebSocketAPI extends EventEmitter {
     if (this.#destroyed || this.#ws?.readyState != OPEN) return
     this.debug?.('outgoing', {cmd: isError ? 'int:errorReply' : 'int:reply', payload, id})
     if (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload) || payload instanceof Blob) {
-      if (isError) throw Error('Can\'t send a binary error reply.')
+      if (isError) throw new SimpleWebSocketAPI_Error(`Can't send a binary error reply.`)
       this.#ws.send(JSON.stringify({cmd: 'int:binaryReply', id}, this.jsonReplacer))
       this.#ws.send(payload)
     } else {
