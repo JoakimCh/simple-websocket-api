@@ -134,14 +134,14 @@ export class SimpleWebSocketAPI extends EventEmitter {
 
   #replyFunc(id) {
     return async (payload, isError) => {
-      if (typeof payload != 'function') {
-        this.#reply(id, payload, isError)
-      } else {
-        try {
+      try {
+        if (typeof payload == 'function') {
           this.#reply(id, await payload(), isError)
-        } catch (error) {
-          this.#reply(id, error, true)
+        } else {
+          this.#reply(id, await payload, isError)
         }
+      } catch (error) {
+        this.#reply(id, error, true)
       }
     }
   }
